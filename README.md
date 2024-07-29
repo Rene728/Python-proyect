@@ -1,2 +1,2 @@
-# Python-proyect
-This a blocks of python about my bachelor’s degree, specifically about the control, the control was implemented with a target controls that have a microcontrollers PIC
+# Mobile Robotic system for the extraction of agricultural soil samples                  
+This a blocks of python about my bachelor’s degree, specifically about the control, the control was implemented with a target controls that have a microcontrollers PIC, we have 4 subsystem in  the robot,  energy system, traction system, control system, and extract system. The robot its able to recollect soil samples, in the interface you define the trajectory that you want and the robot walk through the trajectory collecting  a soil sample of each point in the trajectory.

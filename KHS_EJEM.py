@@ -1,139 +1,186 @@
-import numpy as np
+iimport numpy as np
 import time
 import logging
 import sqlite3
-from PyDAQmx import Task
-import tkinter as tk
-from tkinter import ttk
 from threading import Thread
+from queue import Queue
+from PyDAQmx import Task, DAQmx_Val_Cfg_Default, DAQmx_Val_Volts, DAQmx_Val_Rising, DAQmx_Val_ContSamps
+from pymodbus.client.sync import ModbusTcpClient
+import socket
+from typing import Dict, Tuple, Any
+
+# Configuración de logging para registrar eventos y errores
+logging.basicConfig(
+    filename='sensor_log.txt',  # Archivo de registro
+    level=logging.INFO,         # Nivel de logging: INFO
+    format='%(asctime)s - %(levelname)s - %(message)s'  # Formato del mensaje de logging
+)
 
 # Configuración de los sensores con canales y rangos específicos
 SENSORS = {
-    'temperature': {'channel': 'Dev1/ai0', 'range': (-50.0, 150.0)},  # Ejemplo para RTD PT100
-    'pressure': {'channel': 'Dev1/ai1', 'range': (0, 100)},  # Ejemplo para Honeywell PX3 Series
-    'flow': {'channel': 'Dev1/ai2', 'range': (0, 500)},  # Ejemplo para Siemens SITRANS F M MAG 8000
-    'level': {'channel': 'Dev1/ai3', 'range': (0, 10)},  # Ejemplo para VEGAPULS 64
-    'position': {'channel': 'Dev1/ai4', 'range': (0, 100)},  # Ejemplo para Macro Sensors PR750
-    'force': {'channel': 'Dev1/ai5', 'range': (0, 5000)},  # Ejemplo para HBM C9C
-    'vibration': {'channel': 'Dev1/ai6', 'range': (0, 10)},  # Ejemplo para PCB Piezotronics 352C33
-    'humidity': {'channel': 'Dev1/ai7', 'range': (0, 100)}  # Ejemplo para Sensirion SHT35
+    'temperature': {'channel': 'Dev1/ai0', 'range': (-50.0, 150.0)},
+    'pressure': {'channel': 'Dev1/ai1', 'range': (0, 100)},
+    'flow': {'channel': 'Dev1/ai2', 'range': (0, 500)},
+    'level': {'channel': 'Dev1/ai3', 'range': (0, 10)},
+    'position': {'channel': 'Dev1/ai4', 'range': (0, 100)},
+    'force': {'channel': 'Dev1/ai5', 'range': (0, 5000)},
+    'vibration': {'channel': 'Dev1/ai6', 'range': (0, 10)},
+    'humidity': {'channel': 'Dev1/ai7', 'range': (0, 100)}
 }
 
-# Configuración de logging para registrar eventos y errores
-logging.basicConfig(filename='sensor_log.txt', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Función para configurar la base de datos SQLite
-def setup_database():
-    conn = sqlite3.connect('sensor_data.db')  # Conectar a la base de datos
-    cursor = conn.cursor()  # Crear un cursor para ejecutar comandos
-    # Crear una tabla para almacenar los datos de los sensores si no existe
+# Configuración de la base de datos SQLite
+def setup_database() -> Tuple[sqlite3.Connection, sqlite3.Cursor]:
+    """
+    Configura la base de datos SQLite para almacenar los datos de los sensores.
+    Crea la tabla si no existe.
+    """
+    conn = sqlite3.connect('sensor_data.db')  # Conectar o crear base de datos
+    cursor = conn.cursor()  # Crear un cursor para ejecutar comandos SQL
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sensor_data (
-            timestamp TEXT,
-            sensor TEXT,
-            channel TEXT,
-            value REAL
+            timestamp TEXT,  # Fecha y hora de la lectura
+            sensor TEXT,     # Nombre del sensor
+            channel TEXT,    # Canal del sensor
+            value REAL        # Valor leído del sensor
         )
     ''')
-    conn.commit()  # Confirmar los cambios en la base de datos
-    return conn, cursor  # Devolver la conexión y el cursor
+    conn.commit()  # Guardar cambios en la base de datos
+    return conn, cursor
 
-# Función para insertar datos en la base de datos
-def insert_data(cursor, conn, timestamp, sensor, channel, value):
-    cursor.execute('''
-        INSERT INTO sensor_data (timestamp, sensor, channel, value)
-        VALUES (?, ?, ?, ?)
-    ''', (timestamp, sensor, channel, value))
-    conn.commit()  # Confirmar los cambios en la base de datos
+# Inserción de datos en la base de datos
+def insert_data(cursor: sqlite3.Cursor, conn: sqlite3.Connection, timestamp: str, sensor: str, channel: str, value: float):
+    """
+    Inserta una entrada de datos en la base de datos.
+    """
+    try:
+        cursor.execute('''
+            INSERT INTO sensor_data (timestamp, sensor, channel, value)
+            VALUES (?, ?, ?, ?)
+        ''', (timestamp, sensor, channel, value))
+        conn.commit()  # Guardar cambios en la base de datos
+    except sqlite3.Error as e:
+        logging.error(f"Error al insertar datos en la base de datos: {e}")  # Registrar error en el archivo de log
 
-# Función para configurar una tarea de adquisición de datos en un canal específico
-def configure_task(channel, min_val, max_val):
+# Configuración de la tarea de adquisición de datos
+def configure_task(channel: str, min_val: float, max_val: float) -> Task:
+    """
+    Configura una tarea de adquisición de datos para un canal específico.
+    """
     task = Task()  # Crear una nueva tarea
-    # Configurar el canal de entrada analógica
-    task.CreateAIVoltageChan(channel, "", PyDAQmx.DAQmx_Val_Cfg_Default, min_val, max_val, PyDAQmx.DAQmx_Val_Volts, None)
-    # Configurar el reloj de adquisición
-    task.CfgSampClkTiming("", 1000, PyDAQmx.DAQmx_Val_Rising, PyDAQmx.DAQmx_Val_ContSamps, 1000)
-    return task  # Devolver la tarea configurada
+    task.CreateAIVoltageChan(channel, "", DAQmx_Val_Cfg_Default, min_val, max_val, DAQmx_Val_Volts, None)
+    task.CfgSampClkTiming("", 1000, DAQmx_Val_Rising, DAQmx_Val_ContSamps, 1000)  # Configurar el reloj de muestreo
+    return task
 
-# Función para leer datos de la tarea de adquisición
-def read_data(task):
-    data = np.zeros((1000,), dtype=np.float64)  # Crear un buffer de datos
-    # Leer datos del canal
-    task.ReadAnalogF64(1000, 10.0, PyDAQmx.DAQmx_Val_GroupByChannel, data, len(data), None, None)
-    return np.mean(data)  # Retornar el promedio de los datos leídos
+# Lectura de datos desde el canal configurado
+def read_data(task: Task) -> np.ndarray:
+    """
+    Lee datos del canal de adquisición.
+    """
+    data = np.zeros((1000,), dtype=np.float64)  # Inicializar un array para los datos
+    try:
+        task.ReadAnalogF64(1000, 10.0, DAQmx_Val_GroupByChannel, data, len(data), None, None)
+    except Exception as e:
+        logging.error(f"Error al leer datos del sensor: {e}")  # Registrar error en el archivo de log
+    return data
 
-# Función para procesar los datos adquiridos
-def process_data(data):
-    filtered_data = [x for x in data if 0 < x < 1000]  # Filtrar valores extremos
-    return np.mean(filtered_data) if filtered_data else np.nan  # Retornar el promedio filtrado o NaN si no hay datos válidos
+# Procesamiento de datos para eliminar valores atípicos y calcular el promedio
+def process_data(data: np.ndarray) -> float:
+    """
+    Procesa los datos leídos para filtrar valores atípicos y calcular el promedio.
+    """
+    try:
+        filtered_data = [x for x in data if 0 < x < 1000]  # Filtrar valores atípicos
+        return np.mean(filtered_data) if filtered_data else np.nan  # Calcular el promedio
+    except Exception as e:
+        logging.error(f"Error al procesar datos: {e}")  # Registrar error en el archivo de log
+        return np.nan
 
-# Función para actualizar la interfaz gráfica con los datos de los sensores
-def update_gui(sensor_data):
-    for sensor, data in sensor_data.items():
-        label = sensor_labels[sensor]  # Obtener el widget de la etiqueta del sensor
-        label.config(text=f"{sensor}: {data:.2f}")  # Actualizar el texto de la etiqueta
-
-# Función para ejecutar la adquisición de datos en un hilo separado
-def acquisition_thread():
+# Adquisición de datos de todos los sensores
+def acquire_sensor_data(queue: Queue):
+    """
+    Adquiere y procesa datos de todos los sensores configurados.
+    """
     conn, cursor = setup_database()  # Configurar la base de datos
-    tasks = {}
+    tasks = {}  # Diccionario para almacenar las tareas de adquisición de datos
+    sensor_data = {}  # Diccionario para almacenar los datos leídos
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")  # Obtener la fecha y hora actual
+
+    # Configuración de tareas para todos los sensores
     for sensor, config in SENSORS.items():
         try:
-            task = configure_task(config['channel'], config['range'][0], config['range'][1])  # Configurar tarea para el sensor
-            task.StartTask()  # Iniciar la tarea
-            tasks[sensor] = task  # Guardar la tarea en el diccionario
+            task = configure_task(config['channel'], config['range'][0], config['range'][1])
+            task.StartTask()  # Iniciar la tarea de adquisición de datos
+            tasks[sensor] = task  # Almacenar la tarea en el diccionario
         except Exception as e:
-            logging.error(f"Error configurando el sensor {sensor}: {e}")  # Registrar error en la configuración
+            logging.error(f"Error configurando el sensor {sensor}: {e}")  # Registrar error en el archivo de log
+
+    # Lectura y procesamiento de datos para todos los sensores
+    for sensor, task in tasks.items():
+        try:
+            raw_data = read_data(task)  # Leer datos del sensor
+            processed_data = process_data(raw_data)  # Procesar los datos leídos
+            sensor_data[sensor] = processed_data  # Almacenar los datos procesados
+            insert_data(cursor, conn, timestamp, sensor, SENSORS[sensor]['channel'], processed_data)  # Insertar datos en la base de datos
+        except Exception as e:
+            logging.error(f"Error procesando datos del sensor {sensor}: {e}")  # Registrar error en el archivo de log
+        finally:
+            task.StopTask()  # Detener la tarea
+            task.ClearTask()  # Limpiar la tarea
+
+    conn.close()  # Cerrar la conexión a la base de datos
+    queue.put(sensor_data)  # Enviar los datos al hilo principal a través de una cola
+
+# Enviar datos a LabVIEW mediante un archivo compartido
+def send_to_labview(sensor_data: Dict[str, float]):
+    """
+    Escribe los datos de los sensores en un archivo de texto para que LabVIEW pueda leerlos.
+    """
+    try:
+        with open('sensor_data.txt', 'w') as file:
+            for sensor, value in sensor_data.items():
+                file.write(f"{sensor}: {value}\n")
+    except Exception as e:
+        logging.error(f"Error al escribir datos para LabVIEW: {e}")  # Registrar error en el archivo de log
+
+# Comunicación con el PLC utilizando Modbus
+def communicate_with_plc(sensor_data: Dict[str, float]):
+    """
+    Envía datos de sensores al PLC utilizando el protocolo Modbus TCP.
+    """
+    client = ModbusTcpClient('192.168.1.100')  # Dirección IP del PLC
+    if not client.connect():
+        logging.error("No se pudo conectar al PLC")
+        return
     
     try:
-        while True:
-            sensor_data = {}
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")  # Obtener la hora actual
-            for sensor, task in tasks.items():
-                try:
-                    raw_data = read_data(task)  # Leer datos del sensor
-                    processed_data = process_data([raw_data])  # Procesar los datos
-                    sensor_data[sensor] = processed_data  # Guardar datos procesados
-                    insert_data(cursor, conn, timestamp, sensor, SENSORS[sensor]['channel'], processed_data)  # Insertar datos en la base de datos
-                except Exception as e:
-                    logging.error(f"Error leyendo datos del sensor {sensor}: {e}")  # Registrar error en la lectura de datos
-                    sensor_data[sensor] = np.nan  # Establecer NaN si hay error
-            
-            update_gui(sensor_data)  # Actualizar la interfaz gráfica
-            time.sleep(5)  # Esperar 5 segundos antes de la siguiente lectura
-
-    except KeyboardInterrupt:
-        logging.info("Interrupción por teclado, deteniendo el programa.")  # Registrar interrupción por teclado
+        address = 0  # Dirección de inicio para los registros
+        for sensor, value in sensor_data.items():
+            # Convertir el valor a entero para escribir en el PLC
+            int_value = int(value * 100)  # Ejemplo: escalado para el PLC
+            client.write_register(address, int_value)  # Escribir valor en el PLC
+            address += 1  # Incrementar la dirección para el próximo valor
+    except Exception as e:
+        logging.error(f"Error al comunicar con el PLC: {e}")  # Registrar error en el archivo de log
     finally:
-        for sensor, task in tasks.items():
-            try:
-                task.StopTask()  # Detener la tarea
-                task.ClearTask()  # Limpiar la tarea
-            except Exception as e:
-                logging.error(f"Error deteniendo el sensor {sensor}: {e}")  # Registrar error en la detención de la tarea
-        conn.close()  # Cerrar la conexión a la base de datos
+        client.close()  # Cerrar la conexión al PLC
 
-# Función para iniciar la adquisición de datos
-def start_acquisition():
-    acquisition_thread = Thread(target=acquisition_thread, daemon=True)  # Crear un hilo para la adquisición de datos
-    acquisition_thread.start()  # Iniciar el hilo
+# Función principal para ejecutar la adquisición de datos, enviar a LabVIEW y PLC
+def main():
+    queue = Queue()  # Cola para comunicación entre hilos
+    acquire_thread = Thread(target=acquire_sensor_data, args=(queue,))  # Hilo para adquisición de datos
+    acquire_thread.start()  # Iniciar el hilo de adquisición
+    
+    while acquire_thread.is_alive():
+        time.sleep(10)  # Esperar mientras se adquieren los datos
+        
+        # Procesar los datos adquiridos
+        if not queue.empty():
+            sensor_data = queue.get()  # Obtener los datos de la cola
+            send_to_labview(sensor_data)  # Enviar datos a LabVIEW
+            communicate_with_plc(sensor_data)  # Enviar datos al PLC
+    
+    acquire_thread.join()  # Esperar a que termine el hilo de adquisición
 
-# Configuración de la interfaz gráfica con Tkinter
-root = tk.Tk()
-root.title("Monitor de Sensores")
+if __name__ == "__main__":
+    main()
 
-frame = ttk.Frame(root, padding="10")
-frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-# Crear etiquetas para mostrar los datos de los sensores en la interfaz gráfica
-sensor_labels = {}
-for i, sensor in enumerate(SENSORS.keys()):
-    label = ttk.Label(frame, text=f"{sensor}: 0.00")
-    label.grid(row=i, column=0, padx=5, pady=5, sticky=tk.W)
-    sensor_labels[sensor] = label
-
-# Crear botón para iniciar la adquisición de datos
-start_button = ttk.Button(frame, text="Iniciar Adquisición", command=start_acquisition)
-start_button.grid(row=len(SENSORS), column=0, pady=10)
-
-root.mainloop()  # Ejecutar el bucle principal de la interfaz gráfica
